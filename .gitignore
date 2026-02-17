@@ -1,0 +1,16 @@
+# Dependencias
+node_modules/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Entorno
+.env
+.env.local
+
+# Sistema
+.DS_Store
+
+# Datos locales (jobs y ejecuciones del scheduler)
+data/
