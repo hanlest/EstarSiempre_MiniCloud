@@ -2,24 +2,28 @@ import 'dotenv/config';
 import express from 'express';
 import swaggerUi from 'swagger-ui-express';
 import swaggerSpecs from './swaggerConfig.js';
-import schedulerRoutes from './routes/schedulerRoutes.js';
+import schedulerCloudRoutes from './routes/schedulerCloudRoutes.js';
 import storageRoutes from './routes/storageRoutes.js';
 import uploadStorageRoutes from './routes/uploadStorageRoutes.js';
 import taskRoutes from './routes/taskRoutes.js';
+import tasksCloudRoutes from './routes/tasksCloudRoutes.js';
 import { loadJobsFromDisk, startSchedulerLoop } from './controllers/schedulerController.js';
 import { ensureStorageDataDir } from './controllers/storageController.js';
+import { loadQueuesFromDisk, startTasksLoop } from './controllers/tasksCloudController.js';
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
 app.use(express.json());
 
-// Rutas por recurso
-app.use('/scheduler', schedulerRoutes);
+// Rutas por recurso (bases: STORAGE_API_BASE_URL=http://localhost:8009/storage, SCHEDULER_API_BASE_URL=http://localhost:8009/scheduler)
+app.use('/scheduler/v1', schedulerCloudRoutes);
 app.use('/storage', storageRoutes);
-// POST multipart para subida (body raw); misma firma que GCS
-app.use('/upload', express.raw({ type: '*/*', limit: '500mb' }), uploadStorageRoutes);
+const uploadMiddleware = express.raw({ type: '*/*', limit: '500mb' });
+app.use('/storage/upload', uploadMiddleware, uploadStorageRoutes);
 app.use('/task', taskRoutes);
+// API REST v2 Cloud Tasks (TASKS_API_BASE_URL = http://localhost:8009/tasks)
+app.use('/tasks/v2', tasksCloudRoutes);
 
 /**
  * @openapi
@@ -65,5 +69,7 @@ app.listen(PORT, async () => {
   console.log(`Swagger: http://localhost:${PORT}/api-docs`);
   await ensureStorageDataDir();
   await loadJobsFromDisk();
+  await loadQueuesFromDisk();
+  startTasksLoop();
   startSchedulerLoop();
 });

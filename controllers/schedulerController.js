@@ -113,6 +113,22 @@ function toListJob(job) {
   };
 }
 
+/** Igual que toListJob pero con name completo (formato API Google Cloud Scheduler) */
+function toListJobCloud(job) {
+  return {
+    name: job.name,
+    description: job.description ?? '',
+    schedule: job.schedule,
+    timeZone: job.timeZone ?? 'America/Santiago',
+    state: job.state ?? 'ENABLED',
+    lastAttemptTime: job.lastAttemptTime ?? null,
+    httpTarget: job.httpTarget ? {
+      uri: job.httpTarget.uri,
+      httpMethod: job.httpTarget?.httpMethod ?? 'POST',
+    } : undefined,
+  };
+}
+
 function toDetailJob(job) {
   return {
     name: job.name,
@@ -634,5 +650,235 @@ export const runJob = async (req, res) => {
       error: 'Error al ejecutar job de Cloud Scheduler',
       message: err.message || 'Error desconocido',
     });
+  }
+};
+
+// ---------------------------------------------------------------------------
+// Handlers compatibles con la API REST de Google Cloud Scheduler
+// Rutas: GET/POST .../v1/projects/:projectId/locations/:location/jobs
+//        GET/PATCH/DELETE .../v1/projects/.../locations/.../jobs/:jobName
+//        POST .../v1/projects/.../locations/.../jobs/:jobName  (jobName = "xxx:run" para run)
+// Respuestas: mismo formato que Google (objeto job directo en get/create/update/run; { jobs: [] } en list)
+// ---------------------------------------------------------------------------
+
+/**
+ * Lista jobs (formato API Google: { jobs: [...] }).
+ * GET /v1/projects/:projectId/locations/:location/jobs
+ */
+export const listJobsCloud = async (req, res) => {
+  try {
+    const jobs = Array.from(jobsStore.values()).map(toListJobCloud);
+    return res.json({ jobs });
+  } catch (err) {
+    return res.status(500).json({
+      error: { message: err.message || 'Error desconocido' },
+    });
+  }
+};
+
+/**
+ * Obtiene un job (formato API Google: objeto job directo).
+ * GET /v1/projects/:projectId/locations/:location/jobs/:jobName
+ */
+export const getJobCloud = async (req, res) => {
+  try {
+    const { jobName } = req.params;
+    if (!jobName) return res.status(400).json({ error: { message: 'Nombre del job requerido' } });
+    const job = jobsStore.get(jobName);
+    if (!job) {
+      return res.status(404).json({
+        error: { code: 5, message: `No se encontró un job con el nombre "${jobName}"` },
+      });
+    }
+    return res.json(toDetailJob(job));
+  } catch (err) {
+    return res.status(500).json({ error: { message: err.message || 'Error desconocido' } });
+  }
+};
+
+/**
+ * Crea un job (body = objeto job estilo Google con name completo).
+ * POST /v1/projects/:projectId/locations/:location/jobs
+ * Respuesta: objeto job creado (201).
+ */
+export const createJobCloud = async (req, res) => {
+  try {
+    const body = req.body || {};
+    const { name: fullNameIn, description, schedule, timeZone = 'America/Santiago', httpTarget } = body;
+    const name = fullNameIn ? String(fullNameIn).split('/').filter(Boolean).pop() : null;
+    const uri = httpTarget?.uri;
+    const httpMethod = (httpTarget?.httpMethod || 'POST').toUpperCase();
+
+    if (!name || !schedule || !uri) {
+      return res.status(400).json({
+        error: { message: 'Se requieren: name (o path completo), schedule, httpTarget.uri' },
+      });
+    }
+    const cronCheck = validateCron(schedule);
+    if (!cronCheck.valid) {
+      return res.status(400).json({ error: { message: cronCheck.message } });
+    }
+    if (!VALID_HTTP_METHODS.includes(httpMethod)) {
+      return res.status(400).json({
+        error: { message: `El método debe ser uno de: ${VALID_HTTP_METHODS.join(', ')}` },
+      });
+    }
+    if (jobsStore.has(name)) {
+      return res.status(409).json({
+        error: { code: 6, message: `Un job con el nombre "${name}" ya existe en esta ubicación` },
+      });
+    }
+
+    const job = {
+      name: fullName(name),
+      description: description ?? '',
+      schedule,
+      timeZone,
+      state: 'ENABLED',
+      lastAttemptTime: null,
+      httpTarget: {
+        uri,
+        httpMethod,
+        headers: httpTarget?.headers ?? {},
+        ...(httpTarget?.body != null && { body: httpTarget.body }),
+        ...(httpTarget?.oidcToken && { oidcToken: httpTarget.oidcToken }),
+        ...(httpTarget?.secretHeaders && { secretHeaders: httpTarget.secretHeaders }),
+      },
+    };
+    jobsStore.set(name, job);
+    await saveJobToDisk(name, job);
+    return res.status(201).json(toDetailJob(job));
+  } catch (err) {
+    return res.status(500).json({ error: { message: err.message || 'Error desconocido' } });
+  }
+};
+
+/**
+ * Actualiza un job (body puede incluir updateMask; se aplican los campos enviados).
+ * PATCH /v1/projects/:projectId/locations/:location/jobs/:jobName
+ * Respuesta: objeto job actualizado.
+ */
+export const updateJobCloud = async (req, res) => {
+  try {
+    const { jobName } = req.params;
+    const body = req.body || {};
+    if (!jobName) return res.status(400).json({ error: { message: 'Nombre del job requerido' } });
+
+    const existing = jobsStore.get(jobName);
+    if (!existing) {
+      return res.status(404).json({
+        error: { code: 5, message: `No se encontró un job con el nombre "${jobName}"` },
+      });
+    }
+
+    const {
+      description,
+      schedule,
+      timeZone,
+      httpMethod,
+      uri,
+      headers,
+      body: bodyPayload,
+      oidcServiceAccountEmail,
+      secretHeaders,
+    } = body;
+
+    if (schedule !== undefined) {
+      const cronCheck = validateCron(schedule);
+      if (!cronCheck.valid) {
+        return res.status(400).json({ error: { message: cronCheck.message } });
+      }
+      existing.schedule = schedule;
+    }
+    if (description !== undefined) existing.description = description;
+    if (timeZone !== undefined) existing.timeZone = timeZone;
+
+    if (existing.httpTarget) {
+      if (httpMethod !== undefined) {
+        if (!VALID_HTTP_METHODS.includes(httpMethod.toUpperCase())) {
+          return res.status(400).json({
+            error: { message: `El método debe ser uno de: ${VALID_HTTP_METHODS.join(', ')}` },
+          });
+        }
+        existing.httpTarget.httpMethod = httpMethod.toUpperCase();
+      }
+      if (uri !== undefined) existing.httpTarget.uri = uri;
+      if (headers !== undefined) existing.httpTarget.headers = { ...existing.httpTarget.headers, ...headers };
+      if (bodyPayload !== undefined) {
+        existing.httpTarget.body = typeof bodyPayload === 'string'
+          ? Buffer.from(bodyPayload).toString('base64')
+          : Buffer.from(JSON.stringify(bodyPayload)).toString('base64');
+      }
+      if (oidcServiceAccountEmail !== undefined) {
+        if (oidcServiceAccountEmail) {
+          existing.httpTarget.oidcToken = { serviceAccountEmail: oidcServiceAccountEmail };
+        } else {
+          delete existing.httpTarget.oidcToken;
+        }
+      }
+      if (secretHeaders !== undefined) existing.httpTarget.secretHeaders = secretHeaders;
+    }
+
+    await saveJobToDisk(jobName, existing);
+    return res.json(toDetailJob(existing));
+  } catch (err) {
+    return res.status(500).json({ error: { message: err.message || 'Error desconocido' } });
+  }
+};
+
+/**
+ * Elimina un job (formato API Google: 200 sin cuerpo).
+ * DELETE /v1/projects/:projectId/locations/:location/jobs/:jobName
+ */
+export const deleteJobCloud = async (req, res) => {
+  try {
+    const { jobName } = req.params;
+    if (!jobName) return res.status(400).json({ error: { message: 'Nombre del job requerido' } });
+    if (!jobsStore.has(jobName)) {
+      return res.status(404).json({
+        error: { code: 5, message: `No se encontró un job con el nombre "${jobName}"` },
+      });
+    }
+    jobsStore.delete(jobName);
+    await deleteJobFile(jobName);
+    return res.status(200).end();
+  } catch (err) {
+    return res.status(500).json({ error: { message: err.message || 'Error desconocido' } });
+  }
+};
+
+/**
+ * Ejecuta un job ahora (formato API Google: POST a .../jobs/:jobName con :jobName = "nombre:run").
+ * Respuesta: objeto job (como Google).
+ * POST /v1/projects/:projectId/locations/:location/jobs/:jobName  (jobName = "xxx:run")
+ */
+export const runJobCloud = async (req, res) => {
+  try {
+    let { jobName } = req.params;
+    if (!jobName) return res.status(400).json({ error: { message: 'Nombre del job requerido' } });
+    if (jobName.endsWith(':run')) jobName = jobName.slice(0, -4);
+
+    const job = jobsStore.get(jobName);
+    if (!job) {
+      return res.status(404).json({
+        error: { code: 5, message: `No se encontró un job con el nombre "${jobName}"` },
+      });
+    }
+
+    const result = await executeJobHttp(job);
+    await logExecution({
+      jobName,
+      at: job.lastAttemptTime,
+      ok: result.ok,
+      message: result.ok ? null : result.message,
+    });
+    if (!result.ok) {
+      return res.status(500).json({
+        error: { message: result.message || 'Error al ejecutar el job' },
+      });
+    }
+    return res.json(toDetailJob(job));
+  } catch (err) {
+    return res.status(500).json({ error: { message: err.message || 'Error desconocido' } });
   }
 };

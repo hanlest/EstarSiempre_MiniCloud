@@ -8,7 +8,10 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.resolve(__dirname, '..', process.env.STORAGE_DATA_DIR || 'data');
+
+// STORAGE_DATA_DIR puede ser absoluta (C:\Cloud\Storage) o relativa; en .env usar C:\\Cloud\\Storage o /ruta para evitar escapes
+const rawDataDir = (process.env.STORAGE_DATA_DIR || 'data').replace(/^["']|["']$/g, '').trim();
+const DATA_DIR = path.isAbsolute(rawDataDir) ? path.normalize(rawDataDir) : path.resolve(__dirname, '..', rawDataDir);
 
 async function ensureDir(dir) {
   await fs.mkdir(dir, { recursive: true });
@@ -17,6 +20,7 @@ async function ensureDir(dir) {
 /** Crea el directorio base de storage al arrancar si no existe (p. ej. C:\\Cloud\\Storage). */
 export async function ensureStorageDataDir() {
   await ensureDir(DATA_DIR);
+  console.log('[Storage]   DATA_DIR:', DATA_DIR);
 }
 
 const objectPathToFs = (bucket, objectName) => {
@@ -63,6 +67,7 @@ function toGcsObjectMeta(bucket, objectName, stats, contentType, customMetadata)
 export const getObjectMetadata = async (req, res) => {
   try {
     const { bucket, object: objectName } = req.params;
+    console.log('[Storage]   GET metadata — bucket:', bucket, 'object:', objectName);
     const filePath = objectPathToFs(bucket, objectName);
     const stat = await fs.stat(filePath).catch(() => null);
     if (!stat || !stat.isFile()) {
@@ -83,6 +88,7 @@ export const getObjectMetadata = async (req, res) => {
 export const getObjectMedia = async (req, res) => {
   try {
     const { bucket, object: objectName } = req.params;
+    console.log('[Storage]   GET media — bucket:', bucket, 'object:', objectName);
     const filePath = objectPathToFs(bucket, objectName);
     const stat = await fs.stat(filePath).catch(() => null);
     if (!stat || !stat.isFile()) {
