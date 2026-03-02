@@ -148,7 +148,11 @@ export const listObjects = async (req, res) => {
       const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
       for (const e of entries) {
         const rel = basePath ? `${basePath}/${e.name}` : e.name;
-        if (prefix && !rel.startsWith(prefix)) continue;
+        if (prefix) {
+          const insidePrefix = rel.startsWith(prefix);
+          const prefixUnderThis = prefix.startsWith(rel + '/');
+          if (!insidePrefix && !prefixUnderThis) continue;
+        }
         if (e.isDirectory()) {
           await walk(path.join(dir, e.name), rel);
         } else if (e.isFile() && !e.name.endsWith('.meta.json')) {
