@@ -1,0 +1,15 @@
+# Dependencias
+node_modules/
+
+# Datos almacenados en local (archivos de usuario, tasks, scheduler)
+data/
+
+# Variables de entorno
+.env
+.env.*
+
+# Git
+.git/
+
+# Lock files
+package-lock.json

@@ -28,7 +28,8 @@ const objectPathToFs = (bucket, objectName) => {
   return path.join(DATA_DIR, bucket, decoded);
 };
 
-const metaPath = (filePath) => `${filePath}.meta.json`;
+const metaPath = (filePath) =>
+  path.join(path.dirname(filePath), '.meta', path.basename(filePath) + '.json');
 
 async function readMeta(filePath) {
   try {
@@ -44,7 +45,9 @@ async function writeMeta(filePath, contentType, customMetadata) {
     contentType: contentType || 'application/octet-stream',
     metadata: customMetadata || {}
   };
-  await fs.writeFile(metaPath(filePath), JSON.stringify(meta, null, 0), 'utf-8');
+  const mp = metaPath(filePath);
+  await fs.mkdir(path.dirname(mp), { recursive: true });
+  await fs.writeFile(mp, JSON.stringify(meta, null, 0), 'utf-8');
 }
 
 /** Formato GCS-like para metadata de objeto */
@@ -154,8 +157,9 @@ export const listObjects = async (req, res) => {
           if (!insidePrefix && !prefixUnderThis) continue;
         }
         if (e.isDirectory()) {
+          if (e.name === '.meta') continue;
           await walk(path.join(dir, e.name), rel);
-        } else if (e.isFile() && !e.name.endsWith('.meta.json')) {
+        } else if (e.isFile()) {
           const fullPath = path.join(dir, e.name);
           const stat = await fs.stat(fullPath).catch(() => null);
           const meta = await readMeta(fullPath);
