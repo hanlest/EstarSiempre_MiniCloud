@@ -12,7 +12,7 @@ import { ensureStorageDataDir } from './controllers/storageController.js';
 import { loadQueuesFromDisk, startTasksLoop } from './controllers/tasksCloudController.js';
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 8009;
 
 app.use(express.json());
 

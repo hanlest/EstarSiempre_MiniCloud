@@ -5,7 +5,7 @@ import { dirname, join } from 'path';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const port = process.env.PORT || 8080;
+const port = process.env.PORT || 8009;
 const baseUrl = process.env.BASE_URL || `http://localhost:${port}`;
 
 const options = {

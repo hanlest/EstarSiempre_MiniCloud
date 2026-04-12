@@ -117,6 +117,21 @@ function isTaskDue(task) {
   return t <= Date.now();
 }
 
+function logTaskResult(task, result) {
+  const req = task.httpRequest || {};
+  const method = (req.httpMethod || 'POST').toUpperCase();
+  const url = req.url || '?';
+  const id = task.name ? task.name.split('/').pop() : '';
+  if (result.ok) {
+    console.log(`[Tasks] OK ${method} ${url}${id ? ` #${id}` : ''}`);
+    return;
+  }
+  console.error(`[Tasks] FAIL ${method} ${url}${id ? ` #${id}` : ''} → ${result.message}`);
+  if (result.status === 401) {
+    console.error('[Tasks] (401) Revisa URL del API, CLOUD_TASKS_INVOKER_SECRET y Cloud Run sin auth pública');
+  }
+}
+
 /**
  * Ejecuta la petición HTTP de una tarea (httpRequest.url, body base64, etc.).
  * En local no se usa OIDC; se hace la petición directa.
@@ -128,7 +143,15 @@ async function executeTaskHttp(task) {
   if (!url) return { ok: false, message: 'La tarea no tiene httpRequest.url' };
 
   const method = (req.httpMethod || 'POST').toUpperCase();
-  const headers = { 'Content-Type': 'application/json', ...(req.headers || {}) };
+  const incoming = { ...(req.headers || {}) };
+  delete incoming.authorization;
+  delete incoming.Authorization;
+  const headers = { 'Content-Type': 'application/json', ...incoming };
+  const invokerSecret = process.env.CLOUD_TASKS_INVOKER_SECRET;
+  if (invokerSecret && String(invokerSecret).trim() !== '') {
+    headers['X-Cloud-Tasks-Invoker-Secret'] = invokerSecret;
+  }
+  headers['User-Agent'] = headers['User-Agent'] || 'mini-cloud-tasks/1.0';
   let body = req.body;
   if (body && method !== 'GET') {
     try {
@@ -185,18 +208,10 @@ async function tasksTick() {
     const queueId = parent.split('/').pop();
     for (const task of due) {
       const result = await executeTaskHttp(task);
-      const label = task.name ? task.name.split('/').pop() : queueId;
-      if (result.ok) {
-        console.log(`[Tasks]     Ejecutada tarea ${label} → ${(task.httpRequest || {}).url}`);
-      } else {
-        console.error(`[Tasks]     Error ejecutando tarea ${label}:`, result.message);
-      }
+      logTaskResult(task, result);
       executed++;
       await removeTaskFromQueue(parent, task.name);
     }
-  }
-  if (executed === 0) {
-    console.log('[Tasks]     Revisión: no hay tareas pendientes.');
   }
 }
 
@@ -281,8 +296,8 @@ export async function createQueueCloud(req, res) {
 
 /**
  * GET projects/:projectId/locations/:location/queues/:queueId/tasks
- * Query: responseView (opcional)
- * Respuesta: { tasks: [...] }
+ * Query: responseView, pageSize, pageToken (page* ignorados en emulador; se devuelve todo lo pendiente en cola)
+ * Respuesta alineada con Cloud Tasks v2: { tasks: [...], nextPageToken? }
  */
 export async function listTasksCloud(req, res) {
   try {
@@ -298,7 +313,21 @@ export async function listTasksCloud(req, res) {
     } catch (_) {
       tasks = getTasksForQueueSync(parent);
     }
-    res.json({ tasks });
+    // Homólogo a GCP: si piden página, recortamos (en local suele ser poco volumen)
+    const pageSizeRaw = req.query.pageSize;
+    const pageToken = req.query.pageToken;
+    let pageSize = pageSizeRaw != null ? parseInt(String(pageSizeRaw), 10) : 100;
+    if (Number.isNaN(pageSize) || pageSize < 1) pageSize = 100;
+    pageSize = Math.min(pageSize, 1000);
+    let start = 0;
+    if (pageToken) {
+      const idx = tasks.findIndex((t) => t.name === pageToken);
+      start = idx >= 0 ? idx + 1 : 0;
+    }
+    const slice = tasks.slice(start, start + pageSize);
+    const nextPageToken =
+      start + pageSize < tasks.length && slice.length > 0 ? slice[slice.length - 1].name : null;
+    res.json({ tasks: slice, ...(nextPageToken ? { nextPageToken } : {}) });
   } catch (err) {
     console.error('[Tasks]     listTasksCloud:', err);
     res.status(500).json({ error: { message: err.message } });
@@ -352,23 +381,16 @@ export async function createTaskCloud(req, res) {
     tasksStore.set(parent, tasks);
     await saveTasksForQueue(parent);
     const url = (created.httpRequest || {}).url || '';
-    const tipo = scheduleTime ? `programada ${scheduleTime}` : 'inmediata';
-    console.log(`[Tasks]     Tarea creada: ${taskId} en cola ${queueId} (${tipo}) → ${url}`);
+    const tipo = scheduleTime ? 'scheduled' : 'now';
+    console.log(`[Tasks] +${queueId} ${tipo} → ${url}`);
     res.status(201).json(created);
 
     // Si la tarea es inmediata (sin scheduleTime o ya vencida), quitarla de la cola y ejecutarla en background (evita doble ejecución con el tick)
     if (isTaskDue(created)) {
       removeTaskFromQueue(parent, created.name)
         .then(() => executeTaskHttp(created))
-        .then((result) => {
-          const label = created.name ? created.name.split('/').pop() : 'task';
-          if (result.ok) {
-            console.log(`[Tasks]     Tarea inmediata ejecutada ${label} → ${(created.httpRequest || {}).url}`);
-          } else {
-            console.error(`[Tasks]     Error en tarea inmediata ${label}:`, result.message);
-          }
-        })
-        .catch((err) => console.error('[Tasks]     Error ejecutando tarea inmediata:', err.message));
+        .then((result) => logTaskResult(created, result))
+        .catch((err) => console.error('[Tasks] FAIL (excepción)', err.message));
     }
   } catch (err) {
     console.error('[Tasks]     createTaskCloud:', err);
