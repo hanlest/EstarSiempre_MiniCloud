@@ -8,6 +8,8 @@
  *   POST   /v2/projects/:projectId/locations/:location/queues
  *   GET    /v2/projects/:projectId/locations/:location/queues/:queueId/tasks
  *   POST   /v2/projects/:projectId/locations/:location/queues/:queueId/tasks
+ *   DELETE /v2/projects/:projectId/locations/:location/queues/:queueId/tasks/:taskId
+ *   POST   /v2/projects/:projectId/locations/:location/queues/:queueId/purge
  */
 
 import express from 'express';
@@ -17,6 +19,8 @@ import {
   createQueueCloud,
   listTasksCloud,
   createTaskCloud,
+  deleteTaskCloud,
+  purgeQueueCloud,
 } from '../controllers/tasksCloudController.js';
 
 const router = express.Router({ mergeParams: true });
@@ -26,5 +30,7 @@ router.get('/projects/:projectId/locations/:location/queues/:queueId', getQueueC
 router.post('/projects/:projectId/locations/:location/queues', createQueueCloud);
 router.get('/projects/:projectId/locations/:location/queues/:queueId/tasks', listTasksCloud);
 router.post('/projects/:projectId/locations/:location/queues/:queueId/tasks', createTaskCloud);
+router.delete('/projects/:projectId/locations/:location/queues/:queueId/tasks/:taskId', deleteTaskCloud);
+router.post('/projects/:projectId/locations/:location/queues/:queueId/purge', purgeQueueCloud);
 
 export default router;

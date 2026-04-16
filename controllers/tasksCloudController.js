@@ -7,6 +7,8 @@
  * - Tarea inmediata (sin scheduleTime o scheduleTime <= now): al crearla se quita de la cola y se ejecuta en background (HTTP a httpRequest.url).
  * - Tarea programada (scheduleTime futuro): un proceso cada 10 segundos revisa todas las colas y ejecuta las tareas cuya scheduleTime ya pasó.
  * - Precisión: como el tick es cada 10 s, la ejecución puede retrasarse hasta ~10 s respecto al scheduleTime.
+ * - Reintentos: si el HTTP falla, la tarea permanece en cola con scheduleTime = ahora + backoff (min/max de retryConfig
+ *   de la cola). Por defecto reintentos indefinidos; opcional MINI_CLOUD_TASKS_MAX_ATTEMPTS>0 para abandonar tras N fallos.
  */
 
 import fs from 'fs/promises';
@@ -110,6 +112,92 @@ async function removeTaskFromQueue(parent, taskName) {
 const TASKS_LOOP_INTERVAL_MS = 10 * 1000; // 10 segundos
 let tasksLoopIntervalId = null;
 
+/** Si > 0, se deja de reintentar tras N fallos consecutivos. 0 o ausente = indefinido. */
+function maxRetryAttemptsEnv() {
+  const v = parseInt(process.env.MINI_CLOUD_TASKS_MAX_ATTEMPTS || '0', 10);
+  return Number.isFinite(v) && v > 0 ? v : 0;
+}
+
+function parseDurationToMs(input) {
+  if (input == null) return 1000;
+  if (typeof input === 'number' && Number.isFinite(input)) return Math.max(0, input * 1000);
+  const s = String(input).trim();
+  const sec = /^(\d+(?:\.\d+)?)s$/i.exec(s);
+  if (sec) return Math.max(0, parseFloat(sec[1], 10) * 1000);
+  const min = /^(\d+(?:\.\d+)?)m$/i.exec(s);
+  if (min) return Math.max(0, parseFloat(min[1], 10) * 60 * 1000);
+  const h = /^(\d+(?:\.\d+)?)h$/i.exec(s);
+  if (h) return Math.max(0, parseFloat(h[1], 10) * 3600 * 1000);
+  return 1000;
+}
+
+/**
+ * Backoff exponencial al estilo Cloud Tasks: minBackoff * 2^(failures-1), tope maxBackoff.
+ * @param {number} consecutiveFailures contador tras incrementar (1 = primer fallo)
+ */
+function computeBackoffMs(consecutiveFailures, retryConfig) {
+  const minMs = parseDurationToMs(retryConfig?.minBackoff ?? '0.1s');
+  const maxMs = parseDurationToMs(retryConfig?.maxBackoff ?? '3600s');
+  const exp = Math.min(Math.max(0, consecutiveFailures - 1), 28);
+  const raw = minMs * 2 ** exp;
+  return Math.min(maxMs, Math.max(minMs, Math.round(raw)));
+}
+
+function getRetryConfigForParent(parent) {
+  const q = queuesStore.get(parent);
+  return (
+    q?.retryConfig || {
+      maxAttempts: 100,
+      maxRetryDuration: '3600s',
+      minBackoff: '0.1s',
+      maxBackoff: '3600s',
+    }
+  );
+}
+
+async function upsertTaskInQueue(parent, task) {
+  let tasks = tasksStore.get(parent);
+  if (!tasks) tasks = await loadTasksForQueue(parent);
+  const idx = tasks.findIndex((t) => t.name === task.name);
+  if (idx >= 0) tasks[idx] = task;
+  else tasks.push(task);
+  tasksStore.set(parent, tasks);
+  await saveTasksForQueue(parent);
+}
+
+/**
+ * Tras fallo HTTP: reintento con nuevo scheduleTime o abandono si hay tope de intentos.
+ */
+async function scheduleTaskRetryAfterFailure(parent, task, result) {
+  const req = task.httpRequest || {};
+  const method = (req.httpMethod || 'POST').toUpperCase();
+  const url = req.url || '?';
+  const id = task.name ? task.name.split('/').pop() : '';
+
+  const failures = (task._miniCloudFailures || 0) + 1;
+  task._miniCloudFailures = failures;
+
+  const maxA = maxRetryAttemptsEnv();
+  if (maxA > 0 && failures >= maxA) {
+    console.error(
+      `[Tasks] ABANDON ${method} ${url}${id ? ` #${id}` : ''} tras ${failures} fallos (MINI_CLOUD_TASKS_MAX_ATTEMPTS=${maxA}) → ${result.message}`
+    );
+    await removeTaskFromQueue(parent, task.name);
+    return;
+  }
+
+  const retryConfig = getRetryConfigForParent(parent);
+  const backoffMs = computeBackoffMs(failures, retryConfig);
+  const when = new Date(Date.now() + backoffMs).toISOString();
+  task.scheduleTime = when;
+
+  await upsertTaskInQueue(parent, task);
+  const extra = result.status != null ? ` (${result.status})` : '';
+  console.warn(
+    `[Tasks] RETRY en ${Math.round(backoffMs / 1000)}s intento ${failures}${maxA > 0 ? `/${maxA}` : '/∞'} ${method} ${url}${id ? ` #${id}` : ''}${extra}`
+  );
+}
+
 /** Indica si la tarea debe ejecutarse ya (inmediata o scheduleTime <= now). */
 function isTaskDue(task) {
   if (!task.scheduleTime) return true;
@@ -144,12 +232,19 @@ async function executeTaskHttp(task) {
 
   const method = (req.httpMethod || 'POST').toUpperCase();
   const incoming = { ...(req.headers || {}) };
+  const invokerFromTask =
+    incoming['x-cloud-tasks-invoker-secret'] ?? incoming['X-Cloud-Tasks-Invoker-Secret'];
   delete incoming.authorization;
   delete incoming.Authorization;
+  delete incoming['x-cloud-tasks-invoker-secret'];
+  delete incoming['X-Cloud-Tasks-Invoker-Secret'];
   const headers = { 'Content-Type': 'application/json', ...incoming };
-  const invokerSecret = process.env.CLOUD_TASKS_INVOKER_SECRET;
-  if (invokerSecret && String(invokerSecret).trim() !== '') {
-    headers['X-Cloud-Tasks-Invoker-Secret'] = invokerSecret;
+  const envInvoker = process.env.CLOUD_TASKS_INVOKER_SECRET;
+  const envTrimmed = envInvoker != null ? String(envInvoker).trim() : '';
+  if (envTrimmed !== '') {
+    headers['X-Cloud-Tasks-Invoker-Secret'] = envTrimmed;
+  } else if (invokerFromTask != null && String(invokerFromTask).trim() !== '') {
+    headers['X-Cloud-Tasks-Invoker-Secret'] = String(invokerFromTask).trim();
   }
   headers['User-Agent'] = headers['User-Agent'] || 'mini-cloud-tasks/1.0';
   let body = req.body;
@@ -210,7 +305,11 @@ async function tasksTick() {
       const result = await executeTaskHttp(task);
       logTaskResult(task, result);
       executed++;
-      await removeTaskFromQueue(parent, task.name);
+      if (result.ok) {
+        await removeTaskFromQueue(parent, task.name);
+      } else {
+        await scheduleTaskRetryAfterFailure(parent, task, result);
+      }
     }
   }
 }
@@ -389,11 +488,73 @@ export async function createTaskCloud(req, res) {
     if (isTaskDue(created)) {
       removeTaskFromQueue(parent, created.name)
         .then(() => executeTaskHttp(created))
-        .then((result) => logTaskResult(created, result))
+        .then(async (result) => {
+          logTaskResult(created, result);
+          if (!result.ok) {
+            await scheduleTaskRetryAfterFailure(parent, created, result);
+          }
+        })
         .catch((err) => console.error('[Tasks] FAIL (excepción)', err.message));
     }
   } catch (err) {
     console.error('[Tasks]     createTaskCloud:', err);
+    res.status(500).json({ error: { message: err.message } });
+  }
+}
+
+/**
+ * DELETE projects/:projectId/locations/:location/queues/:queueId/tasks/:taskId
+ * Homólogo a Cloud Tasks v2 (elimina una tarea pendiente).
+ */
+export async function deleteTaskCloud(req, res) {
+  try {
+    const { projectId, location, queueId, taskId } = req.params;
+    const parent = `projects/${projectId}/locations/${location}/queues/${queueId}`;
+    const fullQueueName = parent;
+    if (!queuesStore.has(fullQueueName)) {
+      return res.status(404).json({ error: { code: 5, message: 'Queue not found', status: 'NOT_FOUND' } });
+    }
+    const decodedTaskId = decodeURIComponent(taskId);
+    const taskFullName = `${parent}/tasks/${decodedTaskId}`;
+    let tasks;
+    try {
+      tasks = await loadTasksForQueue(parent);
+    } catch (_) {
+      tasks = getTasksForQueueSync(parent);
+    }
+    const idx = tasks.findIndex((t) => t.name === taskFullName || t.name.endsWith(`/tasks/${decodedTaskId}`));
+    if (idx < 0) {
+      return res.status(404).json({ error: { code: 5, message: 'Task not found', status: 'NOT_FOUND' } });
+    }
+    tasks.splice(idx, 1);
+    tasksStore.set(parent, tasks);
+    await saveTasksForQueue(parent);
+    console.log(`[Tasks]     Eliminada tarea ${decodedTaskId} de ${queueId}`);
+    res.status(200).json({});
+  } catch (err) {
+    console.error('[Tasks]     deleteTaskCloud:', err);
+    res.status(500).json({ error: { message: err.message } });
+  }
+}
+
+/**
+ * POST projects/:projectId/locations/:location/queues/:queueId/purge
+ * Vacía todas las tareas pendientes de la cola (ruta alternativa a …:purge de GCP para Express).
+ */
+export async function purgeQueueCloud(req, res) {
+  try {
+    const { projectId, location, queueId } = req.params;
+    const parent = `projects/${projectId}/locations/${location}/queues/${queueId}`;
+    const fullQueueName = parent;
+    if (!queuesStore.has(fullQueueName)) {
+      return res.status(404).json({ error: { code: 5, message: 'Queue not found', status: 'NOT_FOUND' } });
+    }
+    tasksStore.set(parent, []);
+    await saveTasksForQueue(parent);
+    console.log(`[Tasks]     Cola purgada: ${queueId}`);
+    res.status(200).json({});
+  } catch (err) {
+    console.error('[Tasks]     purgeQueueCloud:', err);
     res.status(500).json({ error: { message: err.message } });
   }
 }
