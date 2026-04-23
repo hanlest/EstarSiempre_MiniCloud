@@ -882,3 +882,26 @@ export const runJobCloud = async (req, res) => {
     return res.status(500).json({ error: { message: err.message || 'Error desconocido' } });
   }
 };
+
+/**
+ * Lista ejecuciones recientes persistidas en data/scheduler/executions.json.
+ * GET /scheduler/executions?limit=200
+ */
+export const getExecutions = async (req, res) => {
+  try {
+    await ensureDir(DATA_DIR);
+    let list = [];
+    try {
+      const content = await fs.readFile(EXECUTIONS_FILE, 'utf8');
+      list = JSON.parse(content);
+      if (!Array.isArray(list)) list = [];
+    } catch {
+      list = [];
+    }
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 200, 1), 500);
+    const slice = list.slice(-limit).reverse();
+    return res.json({ success: true, executions: slice, count: slice.length });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message || 'Error desconocido' });
+  }
+};

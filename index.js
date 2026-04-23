@@ -7,7 +7,7 @@ import storageRoutes from './routes/storageRoutes.js';
 import uploadStorageRoutes from './routes/uploadStorageRoutes.js';
 import taskRoutes from './routes/taskRoutes.js';
 import tasksCloudRoutes from './routes/tasksCloudRoutes.js';
-import { loadJobsFromDisk, startSchedulerLoop } from './controllers/schedulerController.js';
+import { loadJobsFromDisk, startSchedulerLoop, getExecutions } from './controllers/schedulerController.js';
 import { ensureStorageDataDir } from './controllers/storageController.js';
 import { loadQueuesFromDisk, startTasksLoop } from './controllers/tasksCloudController.js';
 
@@ -17,6 +17,7 @@ const PORT = process.env.PORT || 8009;
 app.use(express.json());
 
 // Rutas por recurso (bases: STORAGE_API_BASE_URL=http://localhost:8009/storage, SCHEDULER_API_BASE_URL=http://localhost:8009/scheduler)
+app.get('/scheduler/executions', getExecutions);
 app.use('/scheduler/v1', schedulerCloudRoutes);
 app.use('/storage', storageRoutes);
 const uploadMiddleware = express.raw({ type: '*/*', limit: '500mb' });
